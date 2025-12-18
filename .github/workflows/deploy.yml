@@ -1,0 +1,126 @@
+name: Deploy Bun App to EC2
+
+on:
+  push:
+    branches: [v1/dev]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    services:
+      mongo:
+        image: mongodb/mongodb-community-server
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "echo 'db.runCommand("ping").ok' | mongosh mongodb://localhost:27017/test --quiet"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 10
+
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 10
+
+    steps:
+      - name: Checkout (for context only)
+        uses: actions/checkout@v4
+ 
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+ 
+      - name: Install dependencies # (assuming your project has dependencies)
+        run:  bun install
+
+      - name: Create .env.test.local file
+        run: |
+          echo "${{ secrets.ENV_TEST_LOCAL }}" > .env.test.local
+ 
+      - name: Run tests
+        run: bun run:test
+
+      - name: Setup SSH key
+        run: |
+          echo "${{ secrets.EC2_PRIVATE_KEY }}" > ec2_key.pem
+          chmod 400 ec2_key.pem
+
+      - name: Deploy to EC2 and Run Bun App
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ec2_key.pem ${{ secrets.USER }}@${{ secrets.HOST }} << 'EOF'
+
+          sudo apt update -y
+          sudo apt install -y curl git
+
+          # Install Docker (avoids containerd conflicts)
+          curl -fsSL https://get.docker.com | sh
+          sudo usermod -aG docker $USER
+
+          # Install Bun
+          curl -fsSL https://bun.sh/install | bash
+          export BUN_INSTALL="$HOME/.bun"
+          export PATH="$BUN_INSTALL/bin:$PATH"
+
+          # Clone the private repo using PAT
+          REPO_DIR="flyinn_node_backend"
+          rm -rf $REPO_DIR
+
+          REPO_URL="https://${{secrets.GH_USER}}:${{ secrets.GH_TOKEN }}@github.com/"
+          git clone $REPO_URL
+
+          cd $REPO_DIR
+
+          # Dynamically write the .env file
+          cat <<EOT > .env
+          APP_URL=${{ secrets.APP_URL }}
+          NODE_ENV=${{ secrets.NODE_ENV }}
+          PORT=${{ secrets.PORT }}
+          API_VERSION=${{ secrets.API_VERSION }}
+          MONGO_USERNAME=${{ secrets.MONGO_USERNAME }}
+          MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}
+          MONGO_URL=${{ secrets.MONGO_URL }}
+          MAILTRAP_FROM=${{ secrets.MAILTRAP_FROM }}
+          MAILTRAP_HOST=${{ secrets.MAILTRAP_HOST }}
+          MAILTRAP_PORT=${{ secrets.MAILTRAP_PORT }}
+          MAILTRAP_USERNAME=${{ secrets.MAILTRAP_USERNAME }}
+          MAILTRAP_PASSWORD=${{ secrets.MAILTRAP_PASSWORD }}
+          SENDGRID_SENDER_EMAIL=${{ secrets.SENDGRID_SENDER_EMAIL }}
+          SENDGRID_HOST=${{ secrets.SENDGRID_HOST }}
+          SENDGRID_PORT=${{ secrets.SENDGRID_PORT }}
+          SENDGRID_API_KEY=${{ secrets.SENDGRID_API_KEY }}
+          S3_SECRET_KEY=${{ secrets.S3_SECRET_KEY }}
+          S3_ACCESS_KEY=${{ secrets.S3_ACCESS_KEY }}
+          S3_BUCKET_NAME=${{ secrets.S3_BUCKET_NAME }}
+          S3_REGION=${{ secrets.S3_REGION }}
+          REDIS_USERNAME=${{ secrets.REDIS_USERNAME }}
+          REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+          REDIS_HOST=${{ secrets.REDIS_HOST }}
+          REDIS_PORT=${{ secrets.REDIS_PORT }}
+          JWT_ACCESS_EXPIRE=${{ secrets.JWT_ACCESS_EXPIRE }}
+          JWT_ACCESS_SECRET=${{ secrets.JWT_ACCESS_SECRET }}
+          JWT_REFRESH_EXPIRE=${{ secrets.JWT_REFRESH_EXPIRE }}
+          JWT_REFRESH_SECRET=${{ secrets.JWT_REFRESH_SECRET }}
+          STRIPE_KEY=${{ secrets.STRIPE_KEY }}
+          STRIPE_SECRET=${{ secrets.STRIPE_SECRET }}
+          EOT
+
+          # Build Docker image
+          sudo docker build -t backend .
+
+          # Check if a container named 'backend' exists and remove it
+          if [ "$(docker ps -aq -f name=^backend$)" ]; then
+            echo "Removing old backend container..."
+            sudo docker rm -f backend
+          else
+            echo "No existing backend container found."
+          fi
+
+          # Run Docker container
+          sudo docker run --env-file .env -d --name backend -p 3000:3000 backend
+          EOF
